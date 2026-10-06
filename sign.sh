@@ -60,7 +60,10 @@ CONFIG_FILE="$CONFIG_DIR/config"
 SYSTEMD_SERVICE="acme-cert-renew.service"
 SYSTEMD_TIMER="acme-cert-renew.timer"
 
-LOCAL_SCRIPT="/usr/local/sbin/acme-cert-renew"
+LOCAL_SCRIPT="/root/acme-cert-renew"
+
+# 自动续期脚本仅在首次安装/重新安装时从这里下载一次。
+REMOTE_SCRIPT="https://raw.githubusercontent.com/v2net/zs/main/sign.sh"
 
 # ============================================================
 # 临时工作目录
@@ -219,6 +222,7 @@ install_dependencies() {
             die "apt update 失败"
 
         apt-get install -y \
+            curl \
             wget \
             tar \
             ca-certificates \
@@ -229,6 +233,7 @@ install_dependencies() {
     elif command -v dnf >/dev/null 2>&1; then
 
         dnf install -y \
+            curl \
             wget \
             tar \
             ca-certificates \
@@ -239,6 +244,7 @@ install_dependencies() {
     elif command -v yum >/dev/null 2>&1; then
 
         yum install -y \
+            curl \
             wget \
             tar \
             ca-certificates \
@@ -513,52 +519,45 @@ verify_certificate() {
 
 # ============================================================
 # 安装自动续期脚本
-# ============================================================
-
-install_local_renew_script() {
-
-    info "安装自动续期脚本..."
-
-    mkdir -p "$(dirname "$LOCAL_SCRIPT")"
-
-    cat > "$LOCAL_SCRIPT" <<'SCRIPT'
-#!/bin/bash
-
-set -u
-
-REMOTE_SCRIPT="https://raw.githubusercontent.com/v2net/zs/main/sign.sh"
-
-exec /usr/bin/env bash \
-    -c 'curl -fsSL "$1" | bash -s -- --renew' \
-    bash "$REMOTE_SCRIPT"
-SCRIPT
-
-    chmod 700 "$LOCAL_SCRIPT"
-}
-
-# ============================================================
-# 注意：
-# 上面的本地脚本需要读取配置。
-# 因此改为直接执行当前远程脚本，并由 --renew
-# 模式从 CONFIG_FILE 读取参数。
+#
+# 首次安装时只从 GitHub 下载一次当前版本，保存到
+# /usr/local/sbin/acme-cert-renew。
+# 后续 systemd 续期直接执行本地脚本，不会每天重新拉取远程代码。
+# 如需更新续期脚本，重新执行一次首次安装命令即可。
 # ============================================================
 
 install_local_renew_script() {
 
     info "安装自动续期入口..."
 
-    mkdir -p "$(dirname "$LOCAL_SCRIPT")"
+    mkdir -p "$(dirname "$LOCAL_SCRIPT")" || \
+        die "无法创建自动续期脚本目录"
 
-    cat > "$LOCAL_SCRIPT" <<'SCRIPT'
-#!/bin/bash
+    if ! command -v curl >/dev/null 2>&1; then
+        die "找不到 curl，无法安装自动续期脚本"
+    fi
 
-set -u
+    TEMP_SCRIPT="$LOCAL_SCRIPT.tmp.$$"
 
-REMOTE_SCRIPT="https://raw.githubusercontent.com/v2net/zs/main/sign.sh"
+    rm -f "$TEMP_SCRIPT"
 
-exec curl -fsSL "$REMOTE_SCRIPT" | \
-    bash -s -- "" "" "" "" renew
-SCRIPT
+    curl -fsSL \
+        --max-time 30 \
+        -o "$TEMP_SCRIPT" \
+        "$REMOTE_SCRIPT" || \
+        die "无法下载自动续期脚本"
+
+    if [ ! -s "$TEMP_SCRIPT" ]; then
+        rm -f "$TEMP_SCRIPT"
+        die "自动续期脚本下载结果为空"
+    fi
+
+    chmod 700 "$TEMP_SCRIPT"
+
+    mv -f "$TEMP_SCRIPT" "$LOCAL_SCRIPT" || {
+        rm -f "$TEMP_SCRIPT"
+        die "无法安装自动续期脚本"
+    }
 
     chmod 700 "$LOCAL_SCRIPT"
 }
@@ -642,6 +641,16 @@ certificate_fingerprint() {
 # ============================================================
 
 renew_certificate() {
+
+    # 防止手动执行与 systemd timer 同时续期。
+    LOCK_FILE="/run/acme-cert-renew.lock"
+
+    exec 9>"$LOCK_FILE"
+
+    if ! flock -n 9; then
+        info "已有自动续期任务正在运行，本次跳过"
+        exit 0
+    fi
 
     OLD_CERT="$CERT_DIR/$CERT_NAME"
     OLD_KEY="$CERT_DIR/$KEY_NAME"
