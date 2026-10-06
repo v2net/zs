@@ -1,1077 +1,947 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
+#!/bin/bash
 
 # ============================================================
-# Let's Encrypt 自动签发 + 自动续签
-# lego v3.7.0
+# sign.sh
 #
-# 用法：
+# 首次申请：
 #
-# curl -fsSL https://raw.githubusercontent.com/v2net/zs/main/sign.sh \
-#   | bash -s <DOMAIN> <CERT_DIR> <CERT_NAME> <KEY_NAME>
+# curl -fsSL https://raw.githubusercontent.com/v2net/zs/main/sign.sh | bash -s \
+# <DOMAIN> <CERT_DIR> <CERT_NAME> <KEY_NAME>
 #
-# 参数：
-#   $1 DOMAIN
-#   $2 CERT_DIR
-#   $3 CERT_NAME
-#   $4 KEY_NAME
+# 示例：
+#
+# curl -fsSL https://raw.githubusercontent.com/v2net/zs/main/sign.sh | bash -s \
+# node.example.com /etc/node 99.cer 99.key
 #
 # 功能：
-#   1. 首次申请 Let's Encrypt 证书
-#   2. HTTP-01 challenge，TCP 80
-#   3. lego 数据保存到 /var/lib/lego
-#   4. 每天 systemd 自动检查
-#   5. 剩余 <= 30 天自动续签
-#   6. 续签成功后覆盖指定 cert/key
-#   7. 验证 cert/key 是否匹配
-#   8. 只有真正续签成功才自动重启 VPS
+#
+# 1. 首次申请 Let's Encrypt 证书
+# 2. HTTP-01 / TCP 80 验证
+# 3. 持久化 lego ACME 状态
+# 4. 自动安装 systemd 定时续期
+# 5. 每天检查证书
+# 6. 剩余 30 天以内自动续期
+# 7. 续期成功后覆盖目标证书和私钥
+# 8. 验证证书与私钥匹配
+# 9. 确认真正换证后自动重启 VPS
+#
 # ============================================================
 
-set -o pipefail
+set -u
 
-# ------------------------------------------------------------
-# 固定版本
-# ------------------------------------------------------------
+# ============================================================
+# 参数
+# ============================================================
+
+DOMAIN="${1:-}"
+CERT_DIR="${2:-}"
+CERT_NAME="${3:-}"
+KEY_NAME="${4:-}"
+
+# 自动续期模式
+MODE="${5:-install}"
+
+# ============================================================
+# lego
+# ============================================================
 
 LEGO_VERSION="v3.7.0"
-LEGO_BIN="/usr/local/bin/lego"
+LEGO_FILE="lego_v3.7.0_linux_amd64.tar.gz"
+LEGO_URL="https://github.com/go-acme/lego/releases/download/${LEGO_VERSION}/${LEGO_FILE}"
+
+# ============================================================
+# 持久化目录
+# ============================================================
+
 LEGO_PATH="/var/lib/lego"
+CONFIG_DIR="/etc/acme-cert"
+CONFIG_FILE="$CONFIG_DIR/config"
 
-CONFIG_DIR="/etc/lego-cert-renew"
-CONFIG_FILE="${CONFIG_DIR}/config"
+SYSTEMD_SERVICE="acme-cert-renew.service"
+SYSTEMD_TIMER="acme-cert-renew.timer"
 
-RENEW_BIN="/usr/local/sbin/lego-cert-renew"
+LOCAL_SCRIPT="/usr/local/sbin/acme-cert-renew"
 
-RENEW_DAYS="30"
+# ============================================================
+# 临时工作目录
+# ============================================================
 
-# ------------------------------------------------------------
-# 日志
-# ------------------------------------------------------------
+WORK_DIR="/tmp/acme-cert"
 
-log() {
-    echo "[INFO] $*"
+# ============================================================
+# 输出函数
+# ============================================================
+
+info() {
+    echo "[INFO] $1"
 }
 
 warn() {
-    echo "[WARN] $*" >&2
+    echo "[WARN] $1"
+}
+
+error() {
+    echo "[ERROR] $1"
 }
 
 die() {
-    echo "[ERROR] $*" >&2
+    error "$1"
     exit 1
 }
 
-# ------------------------------------------------------------
-# root
-# ------------------------------------------------------------
+# ============================================================
+# Root
+# ============================================================
 
-if [[ "${EUID}" -ne 0 ]]; then
-    die "必须使用 root 运行"
+if [ "$(id -u)" != "0" ]; then
+    die "请使用 root 用户执行"
 fi
 
-# ------------------------------------------------------------
-# 参数
-# ------------------------------------------------------------
+# ============================================================
+# 参数检查
+# ============================================================
 
-if [[ "$#" -ne 4 ]]; then
+if [ "$MODE" = "renew" ]; then
+    :
+else
 
-    cat >&2 <<'EOF'
+    if [ -z "$DOMAIN" ] || \
+       [ -z "$CERT_DIR" ] || \
+       [ -z "$CERT_NAME" ] || \
+       [ -z "$KEY_NAME" ]; then
 
-用法：
+        echo ""
+        echo "参数错误！"
+        echo ""
+        echo "正确用法："
+        echo ""
+        echo "curl -fsSL https://raw.githubusercontent.com/v2net/zs/main/sign.sh | bash -s <DOMAIN> <CERT_DIR> <CERT_NAME> <KEY_NAME>"
+        echo ""
+        exit 1
+    fi
 
-curl -fsSL https://raw.githubusercontent.com/v2net/zs/main/sign.sh \
-  | bash -s <DOMAIN> <CERT_DIR> <CERT_NAME> <KEY_NAME>
+fi
 
-例如：
+# ============================================================
+# 自动续期模式
+# ============================================================
 
-curl -fsSL https://raw.githubusercontent.com/v2net/zs/main/sign.sh \
-  | bash -s <DOMAIN> <CERT_DIR> <CERT_NAME> <KEY_NAME>
+if [ "$MODE" = "renew" ]; then
 
-参数：
+    if [ ! -f "$CONFIG_FILE" ]; then
+        die "找不到自动续期配置：$CONFIG_FILE"
+    fi
 
-  DOMAIN      域名
-  CERT_DIR    证书目录
-  CERT_NAME   证书文件名
-  KEY_NAME    私钥文件名
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
 
+    if [ -z "${DOMAIN:-}" ] || \
+       [ -z "${CERT_DIR:-}" ] || \
+       [ -z "${CERT_NAME:-}" ] || \
+       [ -z "${KEY_NAME:-}" ]; then
+
+        die "自动续期配置不完整"
+    fi
+
+fi
+
+# ============================================================
+# 域名检查
+# ============================================================
+
+if ! echo "$DOMAIN" | grep -Eq \
+    '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'; then
+
+    die "域名格式不正确"
+fi
+
+# ============================================================
+# 文件名检查
+# ============================================================
+
+case "$CERT_NAME" in
+    */*|"")
+        die "证书文件名不能包含 /"
+        ;;
+esac
+
+case "$KEY_NAME" in
+    */*|"")
+        die "私钥文件名不能包含 /"
+        ;;
+esac
+
+# ============================================================
+# 创建持久化目录
+# ============================================================
+
+mkdir -p "$LEGO_PATH" || \
+    die "无法创建 ACME 状态目录"
+
+mkdir -p "$CONFIG_DIR" || \
+    die "无法创建配置目录"
+
+chmod 700 "$LEGO_PATH"
+chmod 700 "$CONFIG_DIR"
+
+# ============================================================
+# 保存配置
+#
+# 不把域名 / 路径直接写进 systemd unit。
+# 配置文件仅 root 可读。
+# ============================================================
+
+save_config() {
+
+    cat > "$CONFIG_FILE" <<EOF
+DOMAIN=$(printf '%q' "$DOMAIN")
+CERT_DIR=$(printf '%q' "$CERT_DIR")
+CERT_NAME=$(printf '%q' "$CERT_NAME")
+KEY_NAME=$(printf '%q' "$KEY_NAME")
 EOF
 
-    exit 1
-fi
+    chmod 600 "$CONFIG_FILE"
+}
 
-DOMAIN="$1"
-CERT_DIR="$2"
-CERT_NAME="$3"
-KEY_NAME="$4"
-
-TARGET_CERT="${CERT_DIR}/${CERT_NAME}"
-TARGET_KEY="${CERT_DIR}/${KEY_NAME}"
-
-log "域名：${DOMAIN}"
-log "证书：${TARGET_CERT}"
-log "私钥：${TARGET_KEY}"
-
-# ------------------------------------------------------------
-# 基础检查
-# ------------------------------------------------------------
-
-command -v curl >/dev/null 2>&1 \
-    || die "缺少 curl"
-
-command -v tar >/dev/null 2>&1 \
-    || die "缺少 tar"
-
-command -v openssl >/dev/null 2>&1 \
-    || die "缺少 openssl"
-
-command -v systemctl >/dev/null 2>&1 \
-    || die "缺少 systemctl"
-
-# ------------------------------------------------------------
+# ============================================================
 # 安装依赖
-# ------------------------------------------------------------
+# ============================================================
 
 install_dependencies() {
+
+    info "检查系统依赖..."
 
     if command -v apt-get >/dev/null 2>&1; then
 
         export DEBIAN_FRONTEND=noninteractive
 
-        apt-get update -y
+        apt-get update -y >/dev/null 2>&1 || \
+            die "apt update 失败"
 
         apt-get install -y \
-            curl \
+            wget \
+            tar \
             ca-certificates \
             openssl \
-            tar \
-            gzip \
-            coreutils \
-            iproute2 \
-            systemd \
-            dnsutils
+            >/dev/null 2>&1 || \
+            die "依赖安装失败"
 
     elif command -v dnf >/dev/null 2>&1; then
 
         dnf install -y \
-            curl \
+            wget \
+            tar \
             ca-certificates \
             openssl \
-            tar \
-            gzip \
-            coreutils \
-            iproute \
-            systemd \
-            bind-utils
+            >/dev/null 2>&1 || \
+            die "依赖安装失败"
 
     elif command -v yum >/dev/null 2>&1; then
 
         yum install -y \
-            curl \
+            wget \
+            tar \
             ca-certificates \
             openssl \
-            tar \
-            gzip \
-            coreutils \
-            iproute \
-            systemd \
-            bind-utils
+            >/dev/null 2>&1 || \
+            die "依赖安装失败"
 
     else
 
-        warn "无法自动识别包管理器"
-        warn "继续执行，前提是 curl/tar/openssl/systemctl 已存在"
+        die "无法识别包管理器"
 
     fi
 }
 
-install_dependencies
+# ============================================================
+# 安装 / 获取 lego
+# ============================================================
 
-# ------------------------------------------------------------
-# 重新检查依赖
-# ------------------------------------------------------------
+install_lego() {
 
-for cmd in curl tar openssl systemctl; do
+    mkdir -p "$WORK_DIR"
 
-    if ! command -v "${cmd}" >/dev/null 2>&1; then
-        die "缺少依赖：${cmd}"
+    chmod 700 "$WORK_DIR"
+
+    if [ -x "$LEGO_PATH/lego" ]; then
+        return 0
     fi
 
-done
+    info "下载 lego ${LEGO_VERSION}..."
 
-# ------------------------------------------------------------
-# CPU 架构
-# ------------------------------------------------------------
+    cd "$WORK_DIR" || \
+        die "无法进入工作目录"
 
-case "$(uname -m)" in
+    rm -f "$LEGO_FILE"
 
-    x86_64|amd64)
-        LEGO_ARCH="amd64"
-        ;;
+    wget -q --show-progress \
+        -O "$LEGO_FILE" \
+        "$LEGO_URL" || \
+        die "lego 下载失败"
 
-    aarch64|arm64)
-        LEGO_ARCH="arm64"
-        ;;
+    if [ ! -s "$LEGO_FILE" ]; then
+        die "lego 下载文件为空"
+    fi
 
-    armv7l)
-        LEGO_ARCH="arm"
-        ;;
+    info "安装 lego..."
 
-    i386|i686)
-        LEGO_ARCH="386"
-        ;;
+    tar -zxf "$LEGO_FILE" || \
+        die "lego 解压失败"
 
-    *)
-        die "不支持的 CPU 架构：$(uname -m)"
-        ;;
+    if [ ! -f "$WORK_DIR/lego" ]; then
+        die "找不到 lego 可执行文件"
+    fi
 
-esac
+    chmod 755 "$WORK_DIR/lego"
 
-log "CPU 架构：${LEGO_ARCH}"
+    cp -f "$WORK_DIR/lego" "$LEGO_PATH/lego" || \
+        die "无法安装 lego"
 
-# ------------------------------------------------------------
-# lego 下载文件
-#
-# v3.7.0：
-# lego_v3.7.0_linux_amd64.tar.gz
-# lego_v3.7.0_linux_arm64.tar.gz
-# lego_v3.7.0_linux_arm.tar.gz
-# lego_v3.7.0_linux_386.tar.gz
-# ------------------------------------------------------------
+    chmod 755 "$LEGO_PATH/lego"
 
-LEGO_FILE="lego_${LEGO_VERSION}_linux_${LEGO_ARCH}.tar.gz"
-
-LEGO_URL="https://github.com/go-acme/lego/releases/download/${LEGO_VERSION}/${LEGO_FILE}"
-
-log "下载 lego ${LEGO_VERSION}"
-log "${LEGO_URL}"
-
-# ------------------------------------------------------------
-# 临时目录
-# ------------------------------------------------------------
-
-TMP_DIR="$(mktemp -d)"
-
-cleanup() {
-    rm -rf "${TMP_DIR}"
+    rm -f "$WORK_DIR/$LEGO_FILE"
+    rm -f "$WORK_DIR/lego"
 }
 
-trap cleanup EXIT
-
-# ------------------------------------------------------------
-# 下载
-# ------------------------------------------------------------
-
-curl \
-    -fL \
-    --retry 3 \
-    --retry-delay 2 \
-    --connect-timeout 15 \
-    --max-time 180 \
-    -o "${TMP_DIR}/${LEGO_FILE}" \
-    "${LEGO_URL}"
-
-if [[ ! -s "${TMP_DIR}/${LEGO_FILE}" ]]; then
-    die "lego 下载失败"
-fi
-
-# ------------------------------------------------------------
-# 解压
-# ------------------------------------------------------------
-
-log "解压 lego"
-
-tar \
-    -xzf "${TMP_DIR}/${LEGO_FILE}" \
-    -C "${TMP_DIR}"
-
-if [[ ! -f "${TMP_DIR}/lego" ]]; then
-    die "压缩包中没有 lego 文件"
-fi
-
-chmod 755 "${TMP_DIR}/lego"
-
-# ------------------------------------------------------------
-# 验证下载的 lego
-# ------------------------------------------------------------
-
-DOWNLOADED_VERSION="$(
-    "${TMP_DIR}/lego" --version 2>&1 || true
-)"
-
-log "下载的 lego："
-echo "${DOWNLOADED_VERSION}"
-
-if ! echo "${DOWNLOADED_VERSION}" | grep -q "3.7.0"; then
-    die "下载到的 lego 不是 v3.7.0"
-fi
-
-# ------------------------------------------------------------
-# 安装 lego
-# ------------------------------------------------------------
-
-log "安装 lego 到 ${LEGO_BIN}"
-
-install \
-    -m 0755 \
-    "${TMP_DIR}/lego" \
-    "${LEGO_BIN}"
-
-# ------------------------------------------------------------
-# 验证安装
-# ------------------------------------------------------------
-
-INSTALLED_VERSION="$(
-    "${LEGO_BIN}" --version 2>&1
-)"
-
-log "已安装：${INSTALLED_VERSION}"
-
-if ! echo "${INSTALLED_VERSION}" | grep -q "3.7.0"; then
-    die "lego 安装版本不是 v3.7.0"
-fi
-
-# ------------------------------------------------------------
-# 创建目录
-# ------------------------------------------------------------
-
-mkdir -p "${LEGO_PATH}"
-mkdir -p "${CONFIG_DIR}"
-mkdir -p "${CERT_DIR}"
-
-chmod 700 "${LEGO_PATH}"
-chmod 700 "${CONFIG_DIR}"
-
-# ------------------------------------------------------------
-# 检查 TCP 80
-# ------------------------------------------------------------
-
-if command -v ss >/dev/null 2>&1; then
-
-    if ss -lnt 2>/dev/null \
-        | awk '$4 ~ /(^|:)80$/ { found=1 } END { exit !found }'
-    then
-
-        die "TCP 80 已被其他程序占用，HTTP-01 无法使用"
-
-    fi
-
-fi
-
-# ------------------------------------------------------------
+# ============================================================
 # DNS 检查
-# ------------------------------------------------------------
-
-log "检查 DNS：${DOMAIN}"
-
-DNS_IP=""
-
-if command -v getent >/dev/null 2>&1; then
-
-    DNS_IP="$(
-        getent ahostsv4 "${DOMAIN}" 2>/dev/null \
-        | awk '{print $1}' \
-        | sort -u \
-        | head -n 1
-    )"
-
-fi
-
-if [[ -n "${DNS_IP}" ]]; then
-    log "DNS IPv4：${DNS_IP}"
-else
-    warn "无法通过 getent 获取 DNS IPv4"
-fi
-
-# ------------------------------------------------------------
-# 获取公网 IP
-# ------------------------------------------------------------
-
-PUBLIC_IP=""
-
-PUBLIC_IP="$(
-    curl \
-        -4 \
-        -fsSL \
-        --connect-timeout 10 \
-        --max-time 20 \
-        https://api.ipify.org \
-        2>/dev/null \
-        || true
-)"
-
-if [[ -n "${PUBLIC_IP}" ]]; then
-
-    log "VPS 公网 IPv4：${PUBLIC_IP}"
-
-    if [[ -n "${DNS_IP}" && "${DNS_IP}" != "${PUBLIC_IP}" ]]; then
-
-        warn "DNS IPv4 (${DNS_IP}) 与 VPS 公网 IPv4 (${PUBLIC_IP}) 不一致"
-        warn "如果证书申请失败，请检查 DNS A 记录"
-
-    fi
-
-else
-
-    warn "无法获取 VPS 公网 IPv4"
-
-fi
-
-# ------------------------------------------------------------
-# 保存配置
-# ------------------------------------------------------------
-
-cat > "${CONFIG_FILE}" <<EOF
-DOMAIN=$(printf '%q' "${DOMAIN}")
-CERT_DIR=$(printf '%q' "${CERT_DIR}")
-CERT_NAME=$(printf '%q' "${CERT_NAME}")
-KEY_NAME=$(printf '%q' "${KEY_NAME}")
-EOF
-
-chmod 600 "${CONFIG_FILE}"
-
-# ------------------------------------------------------------
-# lego 证书路径
-# ------------------------------------------------------------
-
-LEGO_CERT="${LEGO_PATH}/certificates/${DOMAIN}.crt"
-LEGO_KEY="${LEGO_PATH}/certificates/${DOMAIN}.key"
-
-# ------------------------------------------------------------
-# 首次申请证书
-# ------------------------------------------------------------
-
-if [[ ! -f "${LEGO_CERT}" || ! -f "${LEGO_KEY}" ]]; then
-
-    log "没有找到现有 lego 证书"
-    log "开始申请 Let's Encrypt 证书"
-
-    "${LEGO_BIN}" \
-        --accept-tos \
-        --email="admin@${DOMAIN}" \
-        --domains="${DOMAIN}" \
-        --path="${LEGO_PATH}" \
-        --http \
-        run
-
-    if [[ ! -f "${LEGO_CERT}" ]]; then
-        die "证书申请失败：${LEGO_CERT} 不存在"
-    fi
-
-    if [[ ! -f "${LEGO_KEY}" ]]; then
-        die "证书申请失败：${LEGO_KEY} 不存在"
-    fi
-
-else
-
-    log "检测到已有 lego 证书"
-    log "跳过首次申请"
-
-fi
-
-# ------------------------------------------------------------
-# 验证证书
-# ------------------------------------------------------------
-
-log "验证 lego 证书"
-
-if ! openssl x509 \
-    -in "${LEGO_CERT}" \
-    -noout \
-    -subject \
-    -issuer \
-    -dates
-then
-
-    die "lego 证书无效"
-
-fi
-
-# ------------------------------------------------------------
-# 验证 cert/key 匹配
-# ------------------------------------------------------------
-
-get_cert_hash() {
-
-    openssl x509 \
-        -noout \
-        -modulus \
-        -in "$1" \
-        2>/dev/null \
-    | openssl sha256 \
-    | awk '{print $2}'
-
-}
-
-get_key_hash() {
-
-    openssl rsa \
-        -noout \
-        -modulus \
-        -in "$1" \
-        2>/dev/null \
-    | openssl sha256 \
-    | awk '{print $2}'
-
-}
-
-CERT_HASH="$(get_cert_hash "${LEGO_CERT}")"
-KEY_HASH="$(get_key_hash "${LEGO_KEY}")"
-
-if [[ -z "${CERT_HASH}" || -z "${KEY_HASH}" ]]; then
-    die "无法读取证书或私钥"
-fi
-
-if [[ "${CERT_HASH}" != "${KEY_HASH}" ]]; then
-    die "证书和私钥不匹配"
-fi
-
-log "证书和私钥匹配"
-
-# ------------------------------------------------------------
-# 安装首次申请的证书
-# ------------------------------------------------------------
-
-install_certificate() {
-
-    local source_cert="$1"
-    local source_key="$2"
-
-    local tmp_cert="${TARGET_CERT}.new"
-    local tmp_key="${TARGET_KEY}.new"
-
-    mkdir -p "${CERT_DIR}"
-
-    # 临时文件
-    cp "${source_cert}" "${tmp_cert}"
-    cp "${source_key}" "${tmp_key}"
-
-    chmod 600 "${tmp_cert}"
-    chmod 600 "${tmp_key}"
-
-    # 验证临时证书
-    local cert_hash
-    local key_hash
-
-    cert_hash="$(get_cert_hash "${tmp_cert}")"
-    key_hash="$(get_key_hash "${tmp_key}")"
-
-    if [[ -z "${cert_hash}" || -z "${key_hash}" ]]; then
-
-        rm -f \
-            "${tmp_cert}" \
-            "${tmp_key}"
-
-        die "临时证书验证失败"
-
-    fi
-
-    if [[ "${cert_hash}" != "${key_hash}" ]]; then
-
-        rm -f \
-            "${tmp_cert}" \
-            "${tmp_key}"
-
-        die "临时证书和私钥不匹配"
-
-    fi
-
-    # 备份旧证书
-    if [[ -f "${TARGET_CERT}" ]]; then
-
-        cp -a \
-            "${TARGET_CERT}" \
-            "${TARGET_CERT}.bak"
-
-    fi
-
-    # 备份旧私钥
-    if [[ -f "${TARGET_KEY}" ]]; then
-
-        cp -a \
-            "${TARGET_KEY}" \
-            "${TARGET_KEY}.bak"
-
-    fi
-
-    # 原子替换
-    mv -f \
-        "${tmp_cert}" \
-        "${TARGET_CERT}"
-
-    mv -f \
-        "${tmp_key}" \
-        "${TARGET_KEY}"
-
-    chmod 600 "${TARGET_CERT}"
-    chmod 600 "${TARGET_KEY}"
-
-}
-
-install_certificate \
-    "${LEGO_CERT}" \
-    "${LEGO_KEY}"
-
-log "证书已安装到：${TARGET_CERT}"
-log "私钥已安装到：${TARGET_KEY}"
-
-# ============================================================
-# 创建自动续签脚本
 # ============================================================
 
-log "创建自动续签脚本：${RENEW_BIN}"
+check_dns() {
 
-cat > "${RENEW_BIN}" <<'RENEW_SCRIPT'
-#!/usr/bin/env bash
+    info "检查 DNS 解析..."
 
-set -Eeuo pipefail
-set -o pipefail
+    DOMAIN_IPS=""
 
-# ------------------------------------------------------------
-# 自动续签配置
-# ------------------------------------------------------------
+    if command -v getent >/dev/null 2>&1; then
 
-source "/etc/lego-cert-renew/config"
+        DOMAIN_IPS="$(
+            getent ahostsv4 "$DOMAIN" 2>/dev/null |
+            awk '{print $1}' |
+            sort -u
+        )"
 
-LEGO_BIN="/usr/local/bin/lego"
-LEGO_PATH="/var/lib/lego"
+    fi
 
-RENEW_DAYS="30"
+    if [ -z "$DOMAIN_IPS" ]; then
+        die "域名没有解析到 IPv4"
+    fi
 
-LEGO_CERT="${LEGO_PATH}/certificates/${DOMAIN}.crt"
-LEGO_KEY="${LEGO_PATH}/certificates/${DOMAIN}.key"
+    echo ""
+    echo "DNS IPv4："
+    echo "$DOMAIN_IPS" | while read -r ip; do
+        echo "  $ip"
+    done
+    echo ""
 
-TARGET_CERT="${CERT_DIR}/${CERT_NAME}"
-TARGET_KEY="${CERT_DIR}/${KEY_NAME}"
+    PUBLIC_IP=""
 
-log() {
-    echo "[INFO] $*"
+    if command -v curl >/dev/null 2>&1; then
+
+        PUBLIC_IP="$(
+            curl -4 -fsSL \
+                --max-time 10 \
+                https://api.ipify.org \
+                2>/dev/null || true
+        )"
+
+    fi
+
+    if [ -z "$PUBLIC_IP" ] && \
+       command -v wget >/dev/null 2>&1; then
+
+        PUBLIC_IP="$(
+            wget -4 -qO- \
+                --timeout=10 \
+                https://api.ipify.org \
+                2>/dev/null || true
+        )"
+
+    fi
+
+    if [ -n "$PUBLIC_IP" ]; then
+
+        if echo "$DOMAIN_IPS" | grep -qx "$PUBLIC_IP"; then
+
+            info "DNS 检查通过"
+
+        else
+
+            warn "域名解析 IP 与当前服务器公网 IPv4 不一致"
+            warn "如果使用 CDN、NAT 或代理，可以忽略"
+
+        fi
+
+    fi
 }
 
-warn() {
-    echo "[WARN] $*" >&2
+# ============================================================
+# 检查 TCP 80
+# ============================================================
+
+check_port80() {
+
+    info "检查 TCP 80 端口..."
+
+    PORT80_PROCESS=""
+
+    if command -v ss >/dev/null 2>&1; then
+
+        PORT80_PROCESS="$(
+            ss -ltnp 2>/dev/null |
+            grep -E ':[[:space:]]*80[[:space:]]' ||
+            true
+        )"
+
+    elif command -v netstat >/dev/null 2>&1; then
+
+        PORT80_PROCESS="$(
+            netstat -ltnp 2>/dev/null |
+            grep -E ':[[:space:]]*80[[:space:]]' ||
+            true
+        )"
+
+    fi
+
+    if [ -n "$PORT80_PROCESS" ]; then
+
+        echo ""
+        warn "发现程序正在监听 TCP 80："
+        echo "$PORT80_PROCESS"
+        echo ""
+
+        if [ "$MODE" = "renew" ]; then
+
+            warn "自动续期模式不会进行交互确认"
+
+        else
+
+            read -r -p "是否继续申请？[y/N]: " CONTINUE
+
+            case "$CONTINUE" in
+                y|Y|yes|YES)
+                    ;;
+                *)
+                    echo "已取消"
+                    exit 1
+                    ;;
+            esac
+
+        fi
+
+    fi
 }
 
-die() {
-    echo "[ERROR] $*" >&2
-    exit 1
+# ============================================================
+# 备份证书
+# ============================================================
+
+backup_current_certificate() {
+
+    OLD_CERT="$CERT_DIR/$CERT_NAME"
+    OLD_KEY="$CERT_DIR/$KEY_NAME"
+
+    if [ ! -f "$OLD_CERT" ] && [ ! -f "$OLD_KEY" ]; then
+        return 0
+    fi
+
+    BACKUP_DIR="$CERT_DIR/.backup-$(date +%Y%m%d-%H%M%S)"
+
+    info "备份当前证书"
+
+    mkdir -p "$BACKUP_DIR"
+
+    [ -f "$OLD_CERT" ] && \
+        cp -a "$OLD_CERT" "$BACKUP_DIR/"
+
+    [ -f "$OLD_KEY" ] && \
+        cp -a "$OLD_KEY" "$BACKUP_DIR/"
+
+    chmod 700 "$BACKUP_DIR"
 }
 
-# ------------------------------------------------------------
-# root
-# ------------------------------------------------------------
+# ============================================================
+# 验证证书与私钥
+# ============================================================
 
-if [[ "${EUID}" -ne 0 ]]; then
-    die "必须使用 root"
-fi
+verify_certificate() {
 
-# ------------------------------------------------------------
-# 检查 lego
-# ------------------------------------------------------------
+    CERT_FILE="$1"
+    KEY_FILE="$2"
 
-if [[ ! -x "${LEGO_BIN}" ]]; then
-    die "找不到 lego：${LEGO_BIN}"
-fi
+    if [ ! -s "$CERT_FILE" ]; then
+        die "证书文件不存在或为空"
+    fi
 
-LEGO_VERSION_OUTPUT="$(
-    "${LEGO_BIN}" --version 2>&1 || true
-)"
+    if [ ! -s "$KEY_FILE" ]; then
+        die "私钥文件不存在或为空"
+    fi
 
-if ! echo "${LEGO_VERSION_OUTPUT}" | grep -q "3.7.0"; then
-    die "当前 lego 不是 v3.7.0：${LEGO_VERSION_OUTPUT}"
-fi
-
-# ------------------------------------------------------------
-# 检查证书
-# ------------------------------------------------------------
-
-if [[ ! -f "${LEGO_CERT}" ]]; then
-    die "找不到 lego 证书：${LEGO_CERT}"
-fi
-
-if [[ ! -f "${LEGO_KEY}" ]]; then
-    die "找不到 lego 私钥：${LEGO_KEY}"
-fi
-
-# ------------------------------------------------------------
-# 获取续签前证书 SHA256
-# ------------------------------------------------------------
-
-BEFORE_HASH="$(
-    openssl x509 \
-        -in "${LEGO_CERT}" \
+    if ! openssl x509 \
+        -in "$CERT_FILE" \
         -noout \
-        -fingerprint \
-        -sha256 \
-    | sed 's/^.*=//' \
-    | tr -d ':'
-)"
+        -subject \
+        -issuer \
+        -dates >/dev/null 2>&1; then
 
-BEFORE_END_DATE="$(
+        die "证书格式验证失败"
+    fi
+
+    CERT_PUBLIC_KEY="$WORK_DIR/cert.pub"
+    KEY_PUBLIC_KEY="$WORK_DIR/key.pub"
+
     openssl x509 \
-        -in "${LEGO_CERT}" \
-        -noout \
-        -enddate \
-    | cut -d= -f2
-)"
+        -in "$CERT_FILE" \
+        -pubkey \
+        -noout > "$CERT_PUBLIC_KEY" || \
+        die "无法读取证书公钥"
 
-log "当前证书到期：${BEFORE_END_DATE}"
-log "检查是否需要续签"
+    openssl pkey \
+        -in "$KEY_FILE" \
+        -pubout > "$KEY_PUBLIC_KEY" || \
+        die "无法读取私钥公钥"
 
-# ------------------------------------------------------------
-# lego v3.7.0 续签
-#
+    if ! cmp -s \
+        "$CERT_PUBLIC_KEY" \
+        "$KEY_PUBLIC_KEY"; then
+
+        die "证书与私钥不匹配"
+    fi
+
+    info "证书与私钥匹配"
+}
+
+# ============================================================
+# 安装自动续期脚本
+# ============================================================
+
+install_local_renew_script() {
+
+    info "安装自动续期脚本..."
+
+    mkdir -p "$(dirname "$LOCAL_SCRIPT")"
+
+    cat > "$LOCAL_SCRIPT" <<'SCRIPT'
+#!/bin/bash
+
+set -u
+
+REMOTE_SCRIPT="https://raw.githubusercontent.com/v2net/zs/main/sign.sh"
+
+exec /usr/bin/env bash \
+    -c 'curl -fsSL "$1" | bash -s -- --renew' \
+    bash "$REMOTE_SCRIPT"
+SCRIPT
+
+    chmod 700 "$LOCAL_SCRIPT"
+}
+
+# ============================================================
 # 注意：
-# v3 使用 renew --days
-# ------------------------------------------------------------
-
-if ! "${LEGO_BIN}" \
-    --accept-tos \
-    --email="admin@${DOMAIN}" \
-    --domains="${DOMAIN}" \
-    --path="${LEGO_PATH}" \
-    --http \
-    renew \
-    --days="${RENEW_DAYS}"
-then
-
-    die "lego renew 执行失败"
-
-fi
-
-# ------------------------------------------------------------
-# 检查续签后的证书
-# ------------------------------------------------------------
-
-if [[ ! -f "${LEGO_CERT}" ]]; then
-    die "续签后找不到证书"
-fi
-
-if [[ ! -f "${LEGO_KEY}" ]]; then
-    die "续签后找不到私钥"
-fi
-
-AFTER_HASH="$(
-    openssl x509 \
-        -in "${LEGO_CERT}" \
-        -noout \
-        -fingerprint \
-        -sha256 \
-    | sed 's/^.*=//' \
-    | tr -d ':'
-)"
-
-AFTER_END_DATE="$(
-    openssl x509 \
-        -in "${LEGO_CERT}" \
-        -noout \
-        -enddate \
-    | cut -d= -f2
-)"
-
-log "当前证书到期：${AFTER_END_DATE}"
-
-# ------------------------------------------------------------
-# 判断有没有真正续签
-# ------------------------------------------------------------
-
-if [[ "${BEFORE_HASH}" == "${AFTER_HASH}" ]]; then
-
-    log "证书没有变化"
-    log "当前证书不需要续签"
-    log "不会覆盖目标证书"
-    log "不会重启 VPS"
-
-    exit 0
-
-fi
-
-log "检测到新的证书"
-log "续签已经发生"
-
-# ------------------------------------------------------------
-# 验证新证书
-# ------------------------------------------------------------
-
-if ! openssl x509 \
-    -in "${LEGO_CERT}" \
-    -noout \
-    -subject \
-    -issuer \
-    -dates
-then
-
-    die "新证书无效"
-
-fi
-
-# ------------------------------------------------------------
-# 验证 cert/key
-# ------------------------------------------------------------
-
-get_cert_hash() {
-
-    openssl x509 \
-        -noout \
-        -modulus \
-        -in "$1" \
-        2>/dev/null \
-    | openssl sha256 \
-    | awk '{print $2}'
-
-}
-
-get_key_hash() {
-
-    openssl rsa \
-        -noout \
-        -modulus \
-        -in "$1" \
-        2>/dev/null \
-    | openssl sha256 \
-    | awk '{print $2}'
-
-}
-
-CERT_HASH="$(get_cert_hash "${LEGO_CERT}")"
-KEY_HASH="$(get_key_hash "${LEGO_KEY}")"
-
-if [[ -z "${CERT_HASH}" || -z "${KEY_HASH}" ]]; then
-    die "无法验证新证书和私钥"
-fi
-
-if [[ "${CERT_HASH}" != "${KEY_HASH}" ]]; then
-    die "新证书和私钥不匹配"
-fi
-
-log "新证书和新私钥匹配"
-
-# ------------------------------------------------------------
-# 创建临时文件
-# ------------------------------------------------------------
-
-TMP_CERT="${TARGET_CERT}.new"
-TMP_KEY="${TARGET_KEY}.new"
-
-mkdir -p "${CERT_DIR}"
-
-cp "${LEGO_CERT}" "${TMP_CERT}"
-cp "${LEGO_KEY}" "${TMP_KEY}"
-
-chmod 600 "${TMP_CERT}"
-chmod 600 "${TMP_KEY}"
-
-# ------------------------------------------------------------
-# 再次验证临时文件
-# ------------------------------------------------------------
-
-TMP_CERT_HASH="$(get_cert_hash "${TMP_CERT}")"
-TMP_KEY_HASH="$(get_key_hash "${TMP_KEY}")"
-
-if [[ "${TMP_CERT_HASH}" != "${TMP_KEY_HASH}" ]]; then
-
-    rm -f \
-        "${TMP_CERT}" \
-        "${TMP_KEY}"
-
-    die "临时证书和私钥不匹配"
-
-fi
-
-# ------------------------------------------------------------
-# 备份旧证书
-# ------------------------------------------------------------
-
-if [[ -f "${TARGET_CERT}" ]]; then
-
-    cp -a \
-        "${TARGET_CERT}" \
-        "${TARGET_CERT}.bak"
-
-fi
-
-# ------------------------------------------------------------
-# 备份旧私钥
-# ------------------------------------------------------------
-
-if [[ -f "${TARGET_KEY}" ]]; then
-
-    cp -a \
-        "${TARGET_KEY}" \
-        "${TARGET_KEY}.bak"
-
-fi
-
-# ------------------------------------------------------------
-# 替换证书
-# ------------------------------------------------------------
-
-mv -f \
-    "${TMP_CERT}" \
-    "${TARGET_CERT}"
-
-# ------------------------------------------------------------
-# 替换私钥
-# ------------------------------------------------------------
-
-mv -f \
-    "${TMP_KEY}" \
-    "${TARGET_KEY}"
-
-chmod 600 "${TARGET_CERT}"
-chmod 600 "${TARGET_KEY}"
-
-log "新证书已安装：${TARGET_CERT}"
-log "新私钥已安装：${TARGET_KEY}"
-
-# ------------------------------------------------------------
-# 最终验证
-# ------------------------------------------------------------
-
-FINAL_CERT_HASH="$(get_cert_hash "${TARGET_CERT}")"
-FINAL_KEY_HASH="$(get_key_hash "${TARGET_KEY}")"
-
-if [[ -z "${FINAL_CERT_HASH}" || -z "${FINAL_KEY_HASH}" ]]; then
-    die "最终证书验证失败，拒绝重启"
-fi
-
-if [[ "${FINAL_CERT_HASH}" != "${FINAL_KEY_HASH}" ]]; then
-    die "最终证书和私钥不匹配，拒绝重启"
-fi
-
-log "最终证书/私钥验证通过"
-
-# ------------------------------------------------------------
-# 只有真正续签成功，才重启
-# ------------------------------------------------------------
-
-log "证书已经成功续签"
-log "证书已经成功安装"
-log "证书/私钥验证成功"
-log "准备重启 VPS"
-
-sleep 3
-
-systemctl reboot
-RENEW_SCRIPT
-
-chmod 700 "${RENEW_BIN}"
-
-# ============================================================
-# systemd service
+# 上面的本地脚本需要读取配置。
+# 因此改为直接执行当前远程脚本，并由 --renew
+# 模式从 CONFIG_FILE 读取参数。
 # ============================================================
 
-CONFIG_ID="$(
-    printf '%s' "${DOMAIN}|${CERT_DIR}|${CERT_NAME}|${KEY_NAME}" \
-    | sha256sum \
-    | awk '{print substr($1,1,16)}'
-)"
+install_local_renew_script() {
 
-SERVICE_NAME="lego-cert-renew-${CONFIG_ID}"
-TIMER_NAME="lego-cert-renew-${CONFIG_ID}"
+    info "安装自动续期入口..."
 
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-TIMER_FILE="/etc/systemd/system/${TIMER_NAME}.timer"
+    mkdir -p "$(dirname "$LOCAL_SCRIPT")"
 
-# ------------------------------------------------------------
-# Service
-# ------------------------------------------------------------
+    cat > "$LOCAL_SCRIPT" <<'SCRIPT'
+#!/bin/bash
 
-cat > "${SERVICE_FILE}" <<EOF
+set -u
+
+REMOTE_SCRIPT="https://raw.githubusercontent.com/v2net/zs/main/sign.sh"
+
+exec curl -fsSL "$REMOTE_SCRIPT" | \
+    bash -s -- "" "" "" "" renew
+SCRIPT
+
+    chmod 700 "$LOCAL_SCRIPT"
+}
+
+# ============================================================
+# systemd
+# ============================================================
+
+install_systemd_timer() {
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+
+        warn "当前系统没有 systemd"
+        warn "无法安装自动续期 timer"
+
+        return 0
+    fi
+
+    info "安装自动续期 systemd..."
+
+    install_local_renew_script
+
+    cat > "/etc/systemd/system/$SYSTEMD_SERVICE" <<EOF
 [Unit]
-Description=Let's Encrypt certificate renewal - ${DOMAIN}
-Wants=network-online.target
+Description=Let's Encrypt Certificate Renewal
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=${RENEW_BIN}
+ExecStart=$LOCAL_SCRIPT
 EOF
 
-# ------------------------------------------------------------
-# Timer
-# ------------------------------------------------------------
-
-cat > "${TIMER_FILE}" <<EOF
+    cat > "/etc/systemd/system/$SYSTEMD_TIMER" <<EOF
 [Unit]
-Description=Daily Let's Encrypt renewal check - ${DOMAIN}
+Description=Daily Let's Encrypt Certificate Renewal Check
 
 [Timer]
-OnCalendar=*-*-* 03:35:00
-Persistent=true
+OnCalendar=*-*-* 04:30:00
 RandomizedDelaySec=30m
+Persistent=true
 
 [Install]
 WantedBy=timers.target
 EOF
 
-# ------------------------------------------------------------
-# systemd reload
-# ------------------------------------------------------------
+    systemctl daemon-reload
 
-systemctl daemon-reload
+    systemctl enable "$SYSTEMD_TIMER" >/dev/null 2>&1 || \
+        die "无法启用自动续期 timer"
 
-# ------------------------------------------------------------
-# 启用 timer
-# ------------------------------------------------------------
+    systemctl restart "$SYSTEMD_TIMER" || \
+        die "无法启动自动续期 timer"
 
-systemctl enable --now \
-    "${TIMER_NAME}.timer"
+    info "自动续期已启用"
+}
 
-# ------------------------------------------------------------
-# 检查 timer
-# ------------------------------------------------------------
+# ============================================================
+# 计算证书指纹
+# ============================================================
 
-if ! systemctl is-enabled \
-    "${TIMER_NAME}.timer" \
-    >/dev/null 2>&1
-then
+certificate_fingerprint() {
 
-    die "systemd timer 启用失败"
+    local CERT="$1"
 
+    if [ ! -f "$CERT" ]; then
+        echo ""
+        return
+    fi
+
+    openssl x509 \
+        -in "$CERT" \
+        -noout \
+        -fingerprint \
+        -sha256 2>/dev/null |
+        tr -d '\r\n'
+}
+
+# ============================================================
+# 自动续期
+# ============================================================
+
+renew_certificate() {
+
+    OLD_CERT="$CERT_DIR/$CERT_NAME"
+    OLD_KEY="$CERT_DIR/$KEY_NAME"
+
+    mkdir -p "$CERT_DIR"
+
+    chmod 755 "$CERT_DIR"
+
+    BEFORE_FINGERPRINT="$(
+        certificate_fingerprint "$OLD_CERT"
+    )"
+
+    info "检查证书是否需要续期..."
+
+    cd "$WORK_DIR" || \
+        die "无法进入工作目录"
+
+    "$LEGO_PATH/lego" \
+        --path="$LEGO_PATH" \
+        --email="admin@$DOMAIN" \
+        --domains="$DOMAIN" \
+        --http \
+        renew \
+        --days=30
+
+    LEGO_RESULT=$?
+
+    if [ "$LEGO_RESULT" -ne 0 ]; then
+
+        warn "自动续期检查失败"
+
+        exit "$LEGO_RESULT"
+    fi
+
+    SOURCE_CERT="$LEGO_PATH/certificates/$DOMAIN.crt"
+    SOURCE_KEY="$LEGO_PATH/certificates/$DOMAIN.key"
+
+    if [ ! -f "$SOURCE_CERT" ] || \
+       [ ! -f "$SOURCE_KEY" ]; then
+
+        die "续期后找不到证书文件"
+    fi
+
+    AFTER_FINGERPRINT="$(
+        certificate_fingerprint "$SOURCE_CERT"
+    )"
+
+    # ========================================================
+    # 没有真正换证
+    # ========================================================
+
+    if [ -n "$BEFORE_FINGERPRINT" ] && \
+       [ "$BEFORE_FINGERPRINT" = "$AFTER_FINGERPRINT" ]; then
+
+        info "当前证书无需续期"
+
+        exit 0
+    fi
+
+    # ========================================================
+    # 证书发生变化
+    # ========================================================
+
+    info "检测到新证书"
+
+    BACKUP_DIR="$CERT_DIR/.backup-$(date +%Y%m%d-%H%M%S)"
+
+    mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR"
+
+    [ -f "$OLD_CERT" ] && \
+        cp -a "$OLD_CERT" "$BACKUP_DIR/"
+
+    [ -f "$OLD_KEY" ] && \
+        cp -a "$OLD_KEY" "$BACKUP_DIR/"
+
+    cp -f "$SOURCE_CERT" "$OLD_CERT" || \
+        die "复制新证书失败"
+
+    cp -f "$SOURCE_KEY" "$OLD_KEY" || \
+        die "复制新私钥失败"
+
+    chmod 644 "$OLD_CERT"
+    chmod 600 "$OLD_KEY"
+
+    # ========================================================
+    # 最终验证
+    # ========================================================
+
+    verify_certificate "$OLD_CERT" "$OLD_KEY"
+
+    FINAL_FINGERPRINT="$(
+        certificate_fingerprint "$OLD_CERT"
+    )"
+
+    if [ -z "$FINAL_FINGERPRINT" ]; then
+        die "无法确认新证书指纹"
+    fi
+
+    if [ "$FINAL_FINGERPRINT" = "$BEFORE_FINGERPRINT" ]; then
+
+        warn "证书指纹没有发生变化"
+        exit 0
+    fi
+
+    echo ""
+    echo "=============================================="
+    echo "          证书已成功续期"
+    echo "=============================================="
+    echo ""
+    echo "证书：$OLD_CERT"
+    echo "私钥：$OLD_KEY"
+    echo ""
+    echo "正在重启 VPS..."
+    echo ""
+
+    sync
+
+    systemctl reboot
+}
+
+# ============================================================
+# 自动续期入口
+# ============================================================
+
+if [ "$MODE" = "renew" ]; then
+
+    # 自动续期不进行 DNS / 80 端口交互检查
+    # lego 自己负责 HTTP-01 验证
+
+    mkdir -p "$WORK_DIR"
+    chmod 700 "$WORK_DIR"
+
+    install_dependencies
+    install_lego
+
+    renew_certificate
+
+    exit 0
 fi
 
-if ! systemctl is-active \
-    "${TIMER_NAME}.timer" \
-    >/dev/null 2>&1
-then
+# ============================================================
+# 首次申请
+# ============================================================
 
-    die "systemd timer 启动失败"
+umask 077
 
+echo ""
+echo "=============================================="
+echo "           ACME 证书申请"
+echo "=============================================="
+echo ""
+echo "域名       : $DOMAIN"
+echo "证书目录   : $CERT_DIR"
+echo "证书文件   : $CERT_NAME"
+echo "私钥文件   : $KEY_NAME"
+echo ""
+echo "验证方式   : HTTP-01"
+echo "验证端口   : TCP 80"
+echo ""
+echo "=============================================="
+echo ""
+
+install_dependencies
+
+check_dns
+
+check_port80
+
+mkdir -p "$WORK_DIR"
+chmod 700 "$WORK_DIR"
+
+install_lego
+
+mkdir -p "$CERT_DIR" || \
+    die "无法创建证书目录"
+
+OLD_CERT="$CERT_DIR/$CERT_NAME"
+OLD_KEY="$CERT_DIR/$KEY_NAME"
+
+backup_current_certificate
+
+# ============================================================
+# 保存自动续期配置
+# ============================================================
+
+save_config
+
+# ============================================================
+# 首次申请
+# ============================================================
+
+SOURCE_CERT="$LEGO_PATH/certificates/$DOMAIN.crt"
+SOURCE_KEY="$LEGO_PATH/certificates/$DOMAIN.key"
+
+echo ""
+echo "=============================================="
+echo "开始申请 Let's Encrypt 证书"
+echo "=============================================="
+echo ""
+
+"$LEGO_PATH/lego" \
+    --path="$LEGO_PATH" \
+    --email="admin@$DOMAIN" \
+    --domains="$DOMAIN" \
+    --http \
+    -a run
+
+LEGO_RESULT=$?
+
+if [ "$LEGO_RESULT" -ne 0 ]; then
+
+    echo ""
+    echo "=============================================="
+    error "证书申请失败"
+    echo "=============================================="
+    echo ""
+
+    exit "$LEGO_RESULT"
+fi
+
+# ============================================================
+# 检查生成文件
+# ============================================================
+
+if [ ! -f "$SOURCE_CERT" ]; then
+    die "证书申请完成，但找不到生成的证书"
+fi
+
+if [ ! -f "$SOURCE_KEY" ]; then
+    die "证书申请完成，但找不到生成的私钥"
+fi
+
+# ============================================================
+# 复制证书
+# ============================================================
+
+info "复制证书..."
+
+cp -f "$SOURCE_CERT" "$OLD_CERT" || \
+    die "复制证书失败"
+
+cp -f "$SOURCE_KEY" "$OLD_KEY" || \
+    die "复制私钥失败"
+
+chmod 644 "$OLD_CERT"
+chmod 600 "$OLD_KEY"
+
+# ============================================================
+# 验证
+# ============================================================
+
+verify_certificate "$OLD_CERT" "$OLD_KEY"
+
+# ============================================================
+# 安装自动续期
+# ============================================================
+
+install_systemd_timer
+
+# ============================================================
+# 最终检查
+# ============================================================
+
+if [ ! -s "$OLD_CERT" ]; then
+    die "最终证书文件不存在或为空"
+fi
+
+if [ ! -s "$OLD_KEY" ]; then
+    die "最终私钥文件不存在或为空"
 fi
 
 # ============================================================
 # 完成
 # ============================================================
 
-echo
-echo "============================================================"
-echo " Let's Encrypt 自动续签配置完成"
-echo "============================================================"
-echo
-echo "lego："
-"${LEGO_BIN}" --version
-echo
-echo "域名：${DOMAIN}"
-echo "证书：${TARGET_CERT}"
-echo "私钥：${TARGET_KEY}"
-echo
-echo "lego 数据目录：${LEGO_PATH}"
-echo "续签脚本：${RENEW_BIN}"
-echo
-echo "续签条件：剩余 ${RENEW_DAYS} 天以内"
-echo "HTTP-01：TCP 80"
-echo "自动续签：已启用"
-echo "续签成功：自动覆盖证书/私钥"
-echo "续签成功：自动重启 VPS"
-echo "没有续签：不会重启 VPS"
-echo
-echo "查看 timer："
-echo "systemctl list-timers --all | grep lego-cert-renew"
-echo
-echo "查看 service："
-echo "systemctl status ${SERVICE_NAME}.service"
-echo
-echo "查看日志："
-echo "journalctl -u ${SERVICE_NAME}.service"
-echo
-echo "============================================================"
+echo ""
+echo "=============================================="
+echo "          证书申请成功"
+echo "=============================================="
+echo ""
+echo "证书："
+echo "  $OLD_CERT"
+echo ""
+echo "私钥："
+echo "  $OLD_KEY"
+echo ""
+echo "ACME 状态："
+echo "  $LEGO_PATH"
+echo ""
+echo "自动续期："
+echo "  每天检查一次"
+echo "  剩余 30 天以内自动续期"
+echo ""
+echo "续期成功后："
+echo "  自动覆盖证书"
+echo "  自动验证证书 / 私钥"
+echo "  自动重启 VPS"
+echo ""
+echo "=============================================="
+echo ""
+
+exit 0
